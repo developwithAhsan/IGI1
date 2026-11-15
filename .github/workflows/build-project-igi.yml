@@ -1,0 +1,141 @@
+name: Build Project I.G.I. browser engine
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Intel macOS has more RAM than the standard Apple Silicon runner.
+    # The browser-only build does not compile the native macOS launcher.
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    env:
+      IGI_EXE_URL: ${{ secrets.IGI_EXE_URL }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java for Ghidra
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Python dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python packages
+        shell: bash
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install capstone pefile
+
+      - name: Check private game executable URL
+        shell: bash
+        run: |
+          if [[ -z "$IGI_EXE_URL" ]]; then
+            echo "::error::Add a repository Actions secret named IGI_EXE_URL containing a private, temporary HTTPS download URL for your legally obtained igi.exe."
+            exit 1
+          fi
+          if [[ "$IGI_EXE_URL" != https://* ]]; then
+            echo "::error::IGI_EXE_URL must be an HTTPS URL."
+            exit 1
+          fi
+
+      - name: Download game executable privately
+        shell: bash
+        run: |
+          mkdir -p work
+          curl --fail --location --silent --show-error \
+            "$IGI_EXE_URL" --output work/igi.exe
+          test -s work/igi.exe
+          file work/igi.exe
+
+      - name: Install Ghidra
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_JSON="$(curl --fail --location --silent --show-error \
+            https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest)"
+          GHIDRA_URL="$(printf '%s' "$RELEASE_JSON" | jq -r \
+            '.assets[] | select(.name | test("^ghidra_.*_PUBLIC_.*\\.zip$")) | .browser_download_url' | head -n 1)"
+          if [[ -z "$GHIDRA_URL" || "$GHIDRA_URL" == "null" ]]; then
+            echo "::error::Could not find the official Ghidra ZIP release asset."
+            exit 1
+          fi
+          curl --fail --location --silent --show-error "$GHIDRA_URL" \
+            --output "$RUNNER_TEMP/ghidra.zip"
+          mkdir -p "$RUNNER_TEMP/ghidra"
+          unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$RUNNER_TEMP/ghidra"
+          GHIDRA_HOME="$(find "$RUNNER_TEMP/ghidra" -maxdepth 4 -type f \
+            -path '*/support/analyzeHeadless' -print -quit | sed 's#/support/analyzeHeadless$##')"
+          if [[ -z "$GHIDRA_HOME" ]]; then
+            echo "::error::Ghidra installation did not contain support/analyzeHeadless."
+            exit 1
+          fi
+          echo "GHIDRA_HOME=$GHIDRA_HOME" >> "$GITHUB_ENV"
+
+      - name: Export executable functions with Ghidra
+        shell: bash
+        run: |
+          GHIDRA="$GHIDRA_HOME" sh ghidra/export.sh \
+            "$GITHUB_WORKSPACE/work/igi.exe" \
+            "$GITHUB_WORKSPACE/work/functions.json"
+          test -s work/functions.json
+
+      - name: Install Emscripten
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          "$RUNNER_TEMP/emsdk/emsdk" install latest
+          "$RUNNER_TEMP/emsdk/emsdk" activate latest
+
+      - name: Translate and compile browser engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+
+          # Generate the translated C sources. The native macOS launcher is not needed
+          # for the browser build, so build.sh (which links SDL2/wgpu-native) is skipped.
+          .venv/bin/python -I translator/x86toc.py \
+            work/igi.exe work/functions.json out_all --all --per-file 300
+
+          # macOS ships BSD xargs, which has no GNU -r option. Also limit parallel
+          # Emscripten compiles to keep memory use predictable on hosted runners.
+          sed -i '' 's/xargs -r -P 10/xargs -P 3/' build_web.sh
+
+          PROFILE=ports/project-igi/profile.h sh build_web.sh
+
+          test -s build_web/www/recomp.js
+          test -s build_web/www/recomp.wasm
+
+      - name: Package browser build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cp -R build_web/www/. artifact/
+          cat > artifact/BUILD-INFO.txt <<'EOF'
+          Project I.G.I. browser engine build
+          Includes the generated recomp.js and matching recomp.wasm, plus any companion files emitted by Emscripten.
+          Copy these files into the website's /build/ directory.
+          This archive does not include the game files.
+          EOF
+          (cd artifact && zip -qr "$GITHUB_WORKSPACE/Project-IGI-browser-build.zip" .)
+          test -s Project-IGI-browser-build.zip
+
+      - name: Upload downloadable build ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Project-IGI-browser-build
+          path: Project-IGI-browser-build.zip
+          if-no-files-found: error
+          retention-days: 7
